@@ -63,31 +63,54 @@ def _emits_header(key: Key, table: Table) -> bool:
     )
 
 
-def _header_less_aots(
-    body: list[tuple[Key | None, Item]], prefix: str = ""
-) -> list[tuple[str, AoT]]:
-    """Every emptied array of tables reachable without crossing a header.
+def _empty_aot_locations(
+    body: list[tuple[Key | None, Item]],
+) -> dict[tuple[int, ...], list[tuple[str, AoT]]]:
+    """Route emptied AoTs to ancestor headers across out-of-order fragments.
 
-    An emptied array of tables has no ``[[key]]`` header left to render, so it
-    falls back to the inline ``key = []`` form -- and TOML reads a bare
-    key/value pair into whichever table the closest preceding header opened.
-    So the fallbacks of a scope have to be written at the top of that scope,
-    with a key relative to it, and that includes the ones sitting inside super
-    tables, which emit no header to separate them.
-
-    Returns ``(dotted key, aot)`` pairs, keyed relative to the scope ``body``
-    belongs to.
+    Body positions distinguish aliased tables, and each AoT element starts a
+    separate scope for matching the semantic key paths.
     """
-    found: list[tuple[str, AoT]] = []
-    for k, v in body:
-        if k is None:
-            continue
-        path = f"{prefix}.{k.as_string()}" if prefix else k.as_string()
-        if _is_empty_aot(v):
-            found.append((path, v))
-        elif isinstance(v, Table) and not _emits_header(k, v):
-            found.extend(_header_less_aots(v.value.body, path))
-    return found
+    locations: dict[tuple[int, ...], list[tuple[str, AoT]]] = {}
+
+    def collect_scope(
+        body: list[tuple[Key | None, Item]], position: tuple[int, ...]
+    ) -> None:
+        headers: dict[tuple[SingleKey, ...], tuple[int, ...]] = {}
+        empty: list[tuple[tuple[SingleKey, ...], AoT]] = []
+
+        def collect(
+            body: list[tuple[Key | None, Item]],
+            prefix: tuple[SingleKey, ...],
+            position: tuple[int, ...],
+        ) -> None:
+            for index, (key, item) in enumerate(body):
+                if key is None:
+                    continue
+                path = prefix + tuple(key)
+                occurrence = (*position, index)
+                if isinstance(item, AoT):
+                    if not item.body:
+                        empty.append((path, item))
+                    else:
+                        for offset, table in enumerate(item.body):
+                            collect_scope(table.value.body, (*occurrence, offset))
+                elif isinstance(item, Table):
+                    if _emits_header(key, item):
+                        headers[path] = occurrence
+                    collect(item.value.body, path, occurrence)
+
+        collect(body, (), position)
+        for path, aot in empty:
+            size = len(path) - 1
+            while size and path[:size] not in headers:
+                size -= 1
+            scope = headers[path[:size]] if size else position
+            key = ".".join(part.as_string() for part in path[size:])
+            locations.setdefault(scope, []).append((key, aot))
+
+    collect_scope(body, ())
+    return locations
 
 
 def _render_empty_aot(key: str, aot: AoT) -> str:
@@ -709,9 +732,10 @@ class Container(_CustomDict):  # type: ignore[type-arg]
     def as_string(self) -> str:
         """Render as TOML string."""
         s = ""
-        for path, aot in _header_less_aots(self._body):
+        empty_aots = _empty_aot_locations(self._body)
+        for path, aot in empty_aots.get((), []):
             s += _render_empty_aot(path, aot)
-        for k, v in self._body:
+        for index, (k, v) in enumerate(self._body):
             if k is not None:
                 if _is_empty_aot(v):
                     continue
@@ -722,7 +746,9 @@ class Container(_CustomDict):  # type: ignore[type-arg]
                         and "\n" not in v.trivia.indent
                     ):
                         s += "\n"
-                    s += self._render_table(k, v)
+                    s += self._render_table(
+                        k, v, empty_aots=empty_aots, position=(index,)
+                    )
                 elif isinstance(v, AoT):
                     if (
                         s.strip(" ")
@@ -730,7 +756,9 @@ class Container(_CustomDict):  # type: ignore[type-arg]
                         and "\n" not in v.trivia.indent
                     ):
                         s += "\n"
-                    s += self._render_aot(k, v)
+                    s += self._render_aot(
+                        k, v, empty_aots=empty_aots, position=(index,)
+                    )
                 else:
                     s += self._render_simple_item(k, v)
             else:
@@ -738,7 +766,15 @@ class Container(_CustomDict):  # type: ignore[type-arg]
 
         return s
 
-    def _render_table(self, key: Key, table: Table, prefix: str | None = None) -> str:
+    def _render_table(
+        self,
+        key: Key,
+        table: Table,
+        prefix: str | None = None,
+        *,
+        empty_aots: dict[tuple[int, ...], list[tuple[str, AoT]]],
+        position: tuple[int, ...],
+    ) -> str:
         cur = ""
 
         if table.display_name is not None:
@@ -774,9 +810,9 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         if header_emitted:
             # A super table opens no scope, so its fallbacks belong to -- and
             # were already written by -- the nearest enclosing header instead.
-            for path, aot in _header_less_aots(table.value.body):
+            for path, aot in empty_aots.get(position, []):
                 cur += _render_empty_aot(path, aot)
-        for k, v in table.value.body:
+        for index, (k, v) in enumerate(table.value.body):
             if k is not None and _is_empty_aot(v):
                 continue
             elif isinstance(v, Table):
@@ -790,11 +826,25 @@ class Container(_CustomDict):  # type: ignore[type-arg]
                 if v.is_super_table():
                     if k.is_dotted() and not key.is_dotted():
                         # Dotted key inside table
-                        cur += self._render_table(k, v)
+                        cur += self._render_table(
+                            k, v, empty_aots=empty_aots, position=(*position, index)
+                        )
                     else:
-                        cur += self._render_table(k, v, prefix=_key)
+                        cur += self._render_table(
+                            k,
+                            v,
+                            prefix=_key,
+                            empty_aots=empty_aots,
+                            position=(*position, index),
+                        )
                 else:
-                    cur += self._render_table(k, v, prefix=_key)
+                    cur += self._render_table(
+                        k,
+                        v,
+                        prefix=_key,
+                        empty_aots=empty_aots,
+                        position=(*position, index),
+                    )
             elif isinstance(v, AoT):
                 if (
                     cur.strip(" ")
@@ -803,7 +853,13 @@ class Container(_CustomDict):  # type: ignore[type-arg]
                 ):
                     cur += "\n"
                 assert k is not None
-                cur += self._render_aot(k, v, prefix=_key)
+                cur += self._render_aot(
+                    k,
+                    v,
+                    prefix=_key,
+                    empty_aots=empty_aots,
+                    position=(*position, index),
+                )
             else:
                 cur += self._render_simple_item(
                     k, v, prefix=_key if key.is_dotted() else None
@@ -811,19 +867,36 @@ class Container(_CustomDict):  # type: ignore[type-arg]
 
         return cur
 
-    def _render_aot(self, key: Key, aot: AoT, prefix: str | None = None) -> str:
+    def _render_aot(
+        self,
+        key: Key,
+        aot: AoT,
+        prefix: str | None = None,
+        *,
+        empty_aots: dict[tuple[int, ...], list[tuple[str, AoT]]],
+        position: tuple[int, ...],
+    ) -> str:
         _key = key.as_string()
         if prefix is not None:
             _key = prefix + "." + _key
 
         cur = ""
         _key = decode(_key)
-        for table in aot.body:
-            cur += self._render_aot_table(table, prefix=_key)
+        for index, table in enumerate(aot.body):
+            cur += self._render_aot_table(
+                table, prefix=_key, empty_aots=empty_aots, position=(*position, index)
+            )
 
         return cur
 
-    def _render_aot_table(self, table: Table, prefix: str | None = None) -> str:
+    def _render_aot_table(
+        self,
+        table: Table,
+        prefix: str | None = None,
+        *,
+        empty_aots: dict[tuple[int, ...], list[tuple[str, AoT]]],
+        position: tuple[int, ...],
+    ) -> str:
         cur = ""
         _key = prefix or ""
         open_, close = "[[", "]]"
@@ -838,9 +911,9 @@ class Container(_CustomDict):  # type: ignore[type-arg]
             f"{table.trivia.trail}"
         )
 
-        for path, aot in _header_less_aots(table.value.body):
+        for path, aot in empty_aots.get(position, []):
             cur += _render_empty_aot(path, aot)
-        for k, v in table.value.body:
+        for index, (k, v) in enumerate(table.value.body):
             if k is not None and _is_empty_aot(v):
                 continue
             elif isinstance(v, Table):
@@ -848,14 +921,34 @@ class Container(_CustomDict):  # type: ignore[type-arg]
                 if v.is_super_table():
                     if k.is_dotted():
                         # Dotted key inside table
-                        cur += self._render_table(k, v)
+                        cur += self._render_table(
+                            k, v, empty_aots=empty_aots, position=(*position, index)
+                        )
                     else:
-                        cur += self._render_table(k, v, prefix=_key)
+                        cur += self._render_table(
+                            k,
+                            v,
+                            prefix=_key,
+                            empty_aots=empty_aots,
+                            position=(*position, index),
+                        )
                 else:
-                    cur += self._render_table(k, v, prefix=_key)
+                    cur += self._render_table(
+                        k,
+                        v,
+                        prefix=_key,
+                        empty_aots=empty_aots,
+                        position=(*position, index),
+                    )
             elif isinstance(v, AoT):
                 assert k is not None
-                cur += self._render_aot(k, v, prefix=_key)
+                cur += self._render_aot(
+                    k,
+                    v,
+                    prefix=_key,
+                    empty_aots=empty_aots,
+                    position=(*position, index),
+                )
             else:
                 cur += self._render_simple_item(k, v)
 

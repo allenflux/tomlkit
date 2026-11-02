@@ -1804,3 +1804,49 @@ def test_emptied_array_of_tables_is_relative_to_the_nearest_header() -> None:
     doc["t"]["u"]["a"].pop()
 
     assert doc.as_string() == "[t]\nu.a = []\n"
+
+
+@pytest.mark.parametrize(
+    ("parent_items", "expected"),
+    [
+        ("y = 1", {"a": {"b": {"c": []}, "y": 1}}),
+        ("b.z = 1", {"a": {"b": {"c": [], "z": 1}}}),
+    ],
+)
+def test_emptied_array_of_tables_before_later_parent(
+    parent_items: str, expected: dict[str, Any]
+) -> None:
+    content = f"[[a.b.c]]\nx = 1\n\n[a]\n{parent_items}\n"
+    doc = parse(content)
+    assert doc.as_string() == content
+    elements = doc["a"]["b"]["c"]
+    element = elements.pop()
+
+    rendered = doc.as_string()
+
+    assert parse(rendered).unwrap() == expected
+    assert doc.unwrap() == expected
+    assert doc.as_string() == rendered
+    elements.append(element)
+    assert parse(doc.as_string()).unwrap() == parse(content).unwrap()
+
+
+def test_emptied_array_of_tables_in_shared_table() -> None:
+    shared = tomlkit.table()
+    shared.add("y", 2)
+    elements = tomlkit.aot()
+    elements.append({"x": 1})
+    shared.add("c", elements)
+    doc = tomlkit.document()
+    doc.add("a", shared)
+    doc.add("b", shared)
+    elements.pop()
+
+    rendered = doc.as_string()
+
+    assert parse(rendered).unwrap() == {
+        "a": {"y": 2, "c": []},
+        "b": {"y": 2, "c": []},
+    }
+    assert doc["a"] is doc["b"]
+    assert doc.as_string() == rendered
